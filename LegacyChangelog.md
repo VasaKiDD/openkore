@@ -3,6 +3,7 @@
 =========================
 
 Features:
+
 - New ServerTypes and localized tables for official servers (kLabMouse, Technology, h4rry_84, EternalHarvest)
 - Support for skill and status handles in configuration, allows to use duplicate names (Technology, EternalHarvest)
 - A lot of changes and additions in network; kRO ServerType tree (Technology)
