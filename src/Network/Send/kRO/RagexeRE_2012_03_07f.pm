@@ -52,7 +52,7 @@ sub new {
 		'0929' => ['party_join_request_by_name', 'Z24', [qw(partyName)]],#26
 		'093B' => ['storage_item_add', 'a2 V', [qw(ID amount)]],#8
 		'0963' => ['storage_item_remove', 'a2 V', [qw(ID amount)]],#8
-		'0970' => ['char_create'],#31
+		'0970' => ['char_create', 'a24 C v2', [qw(name slot hair_color hair_style)]],#31
 		'0940' => undef,
 		'0817' => ['buy_bulk_closeShop'],#2
 		'0815' => ['buy_bulk_openShop', 'a4 c a*', [qw(limitZeny result itemInfo)]],#-1

@@ -21,9 +21,9 @@ EXTRA_LIBRARY_DIRECTORIES = []
 # Optimized Flags. Use only on Release.
 EXTRA_COMPILER_FLAGS = ['-Wall', '-O3', '-pipe']
 
-# Brew's readline
-DARWIN_INCLUDE_DIRECTORIES = ['/usr/local/opt/readline/include']
-DARWIN_LIBRARY_DIRECTORIES = ['/usr/local/opt/readline/lib']
+# Brew's readline: /opt/homebrew on Apple Silicon, /usr/local on Intel
+DARWIN_INCLUDE_DIRECTORIES = ['/opt/homebrew/opt/readline/include', '/usr/local/opt/readline/include']
+DARWIN_LIBRARY_DIRECTORIES = ['/opt/homebrew/opt/readline/lib', '/usr/local/opt/readline/lib']
 
 # Fixes for OS X (src/auto/XSTools/darwin/include)
 DARWIN_INCLUDE_DIRECTORIES += ['darwin/include']
@@ -144,6 +144,12 @@ def CheckPerl(context):
 					return line
 			perlconfig['perl'] = cygpath(perlconfig['perl'])
 			perlconfig['coredir'] = cygpath(perlconfig['coredir'])
+
+		if darwin and not os.path.exists(os.path.join(perlconfig['coredir'], 'EXTERN.h')):
+			# Recent macOS ships the system Perl headers only inside the SDK.
+			sdk = os.popen('xcrun --show-sdk-path 2>/dev/null').read().strip()
+			if sdk and os.path.exists(os.path.join(sdk + perlconfig['coredir'], 'EXTERN.h')):
+				perlconfig['coredir'] = sdk + perlconfig['coredir']
 	return ret == 0
 
 def CheckReadline(context, conf):

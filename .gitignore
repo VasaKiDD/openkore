@@ -29,6 +29,7 @@ src/auto/XSTools/PaddedPackets/PaddedPackets.xs.cpp
 src/auto/XSTools/PathFinding/PathFinding.xs.cpp
 src/auto/XSTools/Translation/Translation.xs.cpp
 src/auto/XSTools/XSTools.so
+src/auto/XSTools/XSTools.bundle
 src/auto/XSTools/libXSTools.so
 src/auto/XSTools/misc/fastutils.cpp
 src/auto/XSTools/misc/misc.c

@@ -18,6 +18,7 @@ perltidy --profile=.perltidyrc FILE.pm # formatting (tabs, 4-col indent, 132-col
 ```
 
 - XSTools must be built before running the bot or tests. The compiled module ends up in `src/auto/XSTools/`; Windows ships prebuilt `XSTools.dll`/`NetRedirect.dll` in the repo root.
+- **macOS:** `make` calls `python`, which macOS doesn't have. Build with `python3.11 src/scons-local-3.1.2/scons.py` instead (SCons 3.1.2 needs Python ≤ 3.11) after `brew install python@3.11 readline`. `SConstruct` looks for Homebrew readline under both `/opt/homebrew` and `/usr/local`, and falls back to the Perl headers in the Xcode SDK. The result is `src/auto/XSTools/XSTools.bundle`. System Perl refuses relative bundle paths, so test with `perl -I"$PWD/src" ...`, not `-Isrc`.
 - Tests are `Test::More` modules in `src/test/` that each expose `sub start`. A new test must be added to the `@tests` list in `src/test/unittests.pl` or it won't run by default. CI (`.github/workflows/build_XSTools.yml`) builds XSTools and runs these tests on Windows with Strawberry Perl 5.12 and 5.32, so code must stay compatible with **Perl 5.12**.
 - Every directory has a `Distfiles` manifest used by `makedist.sh`. When you add a new source file, list it in that directory's `Distfiles`.
 
@@ -40,6 +41,8 @@ perltidy --profile=.perltidyrc FILE.pm # formatting (tabs, 4-col indent, 132-col
 **Data files.** `control/` holds user behaviour config (`config.txt`, `mon_control.txt`, `items_control.txt`, `timeouts.txt`, …). `tables/` holds game data and packet tables, layered by `addTableFolders` (for example `translated/kRO_english;kRO`, falling back to the top-level `tables/`). Parsers are in `src/FileParsers.pm`. Map field data lives in `fields/`.
 
 **Plugins.** `plugins/<name>/*.pl` call `Plugins::register(...)` and `Plugins::addHooks([...])` (`src/Plugins.pm`). Which plugins load is set by `loadPlugins`/`loadPlugins_list` in `control/sys.txt`. `plugins/needs-review/` holds unmaintained plugins that aren't loaded by default. Grep for `Plugins::callHook('...')` to find hook points. Console commands are registered in `src/Commands.pm`, and plugins can add their own with `Commands::register`.
+
+**claudeBridge** (`plugins/claudeBridge/`) is this fork's plugin for AI control. `claudeBridge.pl` runs a JSON HTTP API on 127.0.0.1:7777 inside the main loop (a `Base::WebServer` subclass driven by `mainLoop_post`, GET only). It exposes `/state`, `/nearby`, `/inventory`, `/skills`, `/npc`, `/events` (hook and log ring buffer), `/command` (`Commands::run` with captured console output) and `/config`. With `claudeBridge_charName` set, it also creates and selects the character without the interactive menu. `mcp_server.py` (a Python `mcp` 2.x `MCPServer`, run with `uv run --script`) turns that API into MCP tools. The workspace's `bot/` folder runs it; see `../CLAUDE.md`.
 
 **Poseidon** (`src/Poseidon/`, `start-poseidon.exe`) is a separate query server that forwards GameGuard challenges to a real client. It is irrelevant against a private rAthena server.
 
