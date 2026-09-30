@@ -76,7 +76,17 @@ BLOCKED_COMMANDS = {
     "reload": "reloads OpenKore files",
     "plugin": "changes loaded plugins",
     "conf": "use configure",
+    "dump": "stops the bot",
+    "rc": "reloads OpenKore code",
+    "rc2": "reloads OpenKore code",
+    "switchconf": "swaps the whole config file",
+    "timeout": "changes bot timeouts",
+    "misc_conf": "changes bot settings",
+    "connect": "changes the connection",
+    "create": "creates a character",
 }
+# Verbs refused by prefix: the gm* commands run GM-only server commands.
+BLOCKED_COMMAND_PREFIXES = ("gm",)
 
 # Config keys that hold credentials or connection settings; never read or written here.
 SECRET_KEY_MARKERS = ("pass", "pin", "token", "secret", "username", "master", "server", "char", "email", "alias_", "claudebridge_")
@@ -97,7 +107,8 @@ CONFIG_KEYS = {
     "sitAuto_hp_lower", "sitAuto_hp_upper", "sitAuto_sp_lower", "sitAuto_sp_upper",
     "sitAuto_idle", "sitAuto_look",
     "teleportAuto_hp", "teleportAuto_idle", "teleportAuto_search", "teleportAuto_minAggressives",
-    "saveMap", "saveMap_warpToBuyOrSell", "dcOnDeath", "autoTalkCont",
+    "teleportAuto_deadly", "teleportAuto_maxDmg",
+    "saveMap", "saveMap_warpToBuyOrSell", "dcOnDeath", "autoTalkCont", "partyAuto",
     "sellAuto", "storageAuto", "buyAuto",
 }
 CONFIG_PREFIXES = ("useSelf_item_", "useSelf_skill_", "attackSkillSlot_", "attackComboSlot_",
@@ -138,6 +149,34 @@ async def command(cmd: str) -> dict[str, Any]:
     return {"command": cmd, "output": result.get("output", [])}
 
 
+# Per event type, the data keys worth sending (chat payloads repeat the text under
+# several keys; dialog text can be long). Other events keep every key, minus raw
+# packet copies, with long strings cut. The data is always a dict, never a string.
+EVENT_DATA_KEYS = {
+    "packet_pubMsg": ("pubMsgUser", "pubMsg"),
+    "packet_privMsg": ("privMsgUser", "privMsg"),
+    "packet_partyMsg": ("MsgUser", "Msg"),
+    "packet_guildMsg": ("MsgUser", "Msg"),
+    "packet_sentPM": ("to", "msg"),
+    "packet_sysMsg": ("Msg",),
+    "packet_localBroadcast": ("Msg",),
+    "npc_talk": ("name", "ID", "msg"),
+    "npc_talk_responses": ("name", "responses"),
+}
+MAX_EVENT_STRING = 1500
+DROPPED_EVENT_KEYS = ("RawMsg", "raw")
+
+
+def _compact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= MAX_EVENT_STRING else value[-MAX_EVENT_STRING:]
+    if isinstance(value, dict):
+        return {k: _compact_value(v) for k, v in value.items() if k not in DROPPED_EVENT_KEYS}
+    if isinstance(value, list):
+        return [_compact_value(v) for v in value[:50]]
+    return value
+
+
 def compact_event(event: dict[str, Any]) -> dict[str, Any]:
     data = event.get("data")
     out: dict[str, Any] = {"seq": event["seq"], "type": event["type"]}
@@ -146,9 +185,12 @@ def compact_event(event: dict[str, Any]) -> dict[str, Any]:
     if isinstance(data, dict) and "text" in data and event["type"].startswith("log/"):
         out["domain"] = data.get("domain")
         out["text"] = data["text"][:300]
+    elif isinstance(data, dict) and data:
+        keys = EVENT_DATA_KEYS.get(event["type"])
+        picked = {k: data[k] for k in keys if k in data} if keys else data
+        out["data"] = _compact_value(picked)
     elif data not in (None, {}, []):
-        text = str(data)
-        out["data"] = data if len(text) <= 400 else text[:400] + "..."
+        out["data"] = _compact_value(data)
     return out
 
 
@@ -320,6 +362,35 @@ async def get_config(key: str) -> dict[str, Any]:
     if is_secret_key(key):
         return {"error": f"'{key}' is not readable here"}
     return await bridge("/config", key=key)
+
+
+@game_tool(READ_ONLY)
+async def get_configs(keys: list[str]) -> dict[str, Any]:
+    """Read several OpenKore config.txt behaviour settings in one call. Returns
+    {"values": {key: value or null}}; account and connection settings are refused
+    and listed under "refused"."""
+    wanted = [k.strip() for k in keys if k and k.strip()]
+    if not wanted:
+        return {"error": "keys is required"}
+    refused = [k for k in wanted if is_secret_key(k)]
+    allowed = [k for k in wanted if not is_secret_key(k)]
+    result: dict[str, Any] = {"values": {}}
+    if allowed:
+        data = await bridge("/config", keys=",".join(allowed))
+        result["values"] = data.get("values") or {}
+        refused += data.get("refused") or []
+    if refused:
+        result["refused"] = refused
+    return result
+
+
+@game_tool(READ_ONLY)
+async def get_storage() -> dict[str, Any]:
+    """The Kafra storage contents while it is open (talk to a Kafra employee and
+    choose the storage first): {"open": bool, "items": [{id, nameID, name, amount,
+    type}]}. The id is the storage id that storage_move take uses."""
+    data = await bridge("/storage")
+    return {"open": bool(data.get("open")), "title": data.get("title"), "items": data.get("items") or []}
 
 
 @game_tool(READ_ONLY)
@@ -549,9 +620,14 @@ async def configure(key: str, value: str) -> dict[str, Any]:
 
 
 @game_tool(ACTION)
-async def say(message: str, to: str | None = None) -> dict[str, Any]:
-    """Say something in public chat, or whisper a player by name (to)."""
-    cmd = f'pm "{to}" {message}' if to else f"c {message}"
+async def say(message: str, to: str | None = None,
+              channel: Literal["public", "party", "guild"] = "public") -> dict[str, Any]:
+    """Say something in public chat (everyone nearby reads it), in party or guild chat
+    (channel), or whisper a player by name (to; the channel is then ignored)."""
+    if to:
+        cmd = f'pm "{to}" {message}'
+    else:
+        cmd = {"public": "c", "party": "p", "guild": "g"}[channel] + f" {message}"
     return await command(cmd)
 
 
@@ -568,6 +644,8 @@ async def run_command(command_line: str) -> dict[str, Any]:
         return {"error": "one command at a time (';;' is not allowed)"}
     if verb in BLOCKED_COMMANDS:
         return {"error": f"'{verb}' is not allowed here: {BLOCKED_COMMANDS[verb]}"}
+    if verb.startswith(BLOCKED_COMMAND_PREFIXES):
+        return {"error": f"'{verb}' is not allowed here: GM commands are not for the bot"}
     return await command(command_line.strip())
 
 
@@ -622,7 +700,7 @@ async def sell_items(items: list[dict[str, int]]) -> dict[str, Any]:
 async def storage_move(direction: Literal["put", "take"], item_id: int, amount: int | None = None) -> dict[str, Any]:
     """Move items between inventory and Kafra storage (open it with a Kafra NPC
     first). put: item_id is an inventory id (equipped items refused). take: item_id
-    is a storage id (see run_command "storage")."""
+    is a storage id (see get_storage)."""
     if direction == "put":
         await unequipped_item(item_id)
         cmd = f"storage add {item_id}"

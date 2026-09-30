@@ -36,6 +36,8 @@
 #   /events?since=SEQ&limit=N       game events (hooks and selected console messages)
 #   /command?cmd=TEXT               run a console command, returns its console output
 #   /config?key=K[&value=V]         read a config.txt key, or set it through 'conf'
+#   /config?keys=A,B,C              read several config.txt keys at once ({"values": {key: value}})
+#   /storage                        the Kafra storage contents while it is open
 #
 # Every actor in /nearby carries "oid", the hex actor ID, which stays the same
 # while the actor is around; "id" is OpenKore's list index and can change.
@@ -84,7 +86,12 @@ my @EVENT_HOOKS = qw(
 	party_invite incoming_deal quest_added quest_mission_updated
 	player_spawned player_disappeared
 	route fail_calc_map_route AI_state_change changed_status
+	packet/guild_request
 );
+
+# Hooks recorded under another event type (guild invites have no hook of their
+# own; the packet handler's hook is used instead).
+my %EVENT_TYPE_FOR_HOOK = ('packet/guild_request' => 'guild_invite');
 
 # Console message domains recorded as events, in addition to every warning and error.
 # (The "connection" domain is not recorded: it floods the ring and /health has the state.)
@@ -185,8 +192,15 @@ sub onEventHook {
 	} elsif ($hookName eq 'Network::Receive::map_changed') {
 		$data = plain($args);
 		$data->{map} = mapName();
+	} elsif ($hookName eq 'packet/guild_request') {
+		# The parsed packet: ID (binary guild id) and name (raw bytes).
+		$data = {
+			guildID   => defined $args->{ID} ? unpack('H*', $args->{ID}) : undef,
+			guildName => defined $args->{name} ? Utils::bytesToString($args->{name}) : undef,
+		};
 	} else {
 		$data = plain($args);
+		enrichEvent($hookName, $args, $data) if ref $data eq 'HASH' && ref $args eq 'HASH';
 	}
 	$counters{kills}++         if $hookName eq 'target_died';
 	$counters{deaths}++        if $hookName eq 'self_died';
@@ -194,7 +208,55 @@ sub onEventHook {
 	if ($hookName eq 'zeny_change' && ref $args eq 'HASH' && defined $args->{change}) {
 		$args->{change} > 0 ? ($counters{zenyGained} += $args->{change}) : ($counters{zenySpent} -= $args->{change});
 	}
-	pushEvent($hookName, $data);
+	pushEvent($EVENT_TYPE_FOR_HOOK{$hookName} || $hookName, $data);
+}
+
+# Adds to an event the names a player would see on screen for ids the hook only
+# gives as numbers or binary ids (job, status, emotion, quest, item), and whether
+# the event is about this character. Client labels only; nothing about strategy.
+sub enrichEvent {
+	my ($hookName, $args, $data) = @_;
+	if ($hookName eq 'packet_useitem') {
+		my $self = defined $args->{userID} && defined $accountID && $args->{userID} eq $accountID;
+		$data->{isSelf} = bool($self);
+		my $item = $args->{item};
+		my $name = ref $item ? $item->{name} : undef;
+		$name = $items_lut{$args->{itemID}} if !defined $name && defined $args->{itemID};
+		$data->{item} = {name => $name, nameID => num($args->{itemID}), binID => num($args->{binID})} if defined $name;
+		if (!$self && defined $args->{userID}) {
+			my $actor = eval { Actor::get($args->{userID}) };
+			$data->{userName} = eval { $actor->name } if $actor;
+		}
+	} elsif ($hookName eq 'changed_status') {
+		my $actor = $args->{actor};
+		if (blessed $actor) {
+			my @names = sort map { $statusName{$_} || $_ } keys %{$actor->{statuses} || {}};
+			$data->{actorName} = eval { $actor->name };
+			$data->{isSelf}    = bool(defined $actor->{ID} && defined $accountID && $actor->{ID} eq $accountID);
+			$data->{statuses}  = \@names;
+			$data->{status}    = @names ? join(', ', @names) : 'none';
+		}
+	} elsif ($hookName eq 'job_changed') {
+		$data->{old_job_name} = jobName($args->{old_job});
+		$data->{new_job_name} = jobName($args->{new_job});
+	} elsif ($hookName eq 'packet_emotion') {
+		$data->{emotionName} = $args->{emotion};
+		if (defined $args->{ID}) {
+			$data->{isSelf} = bool(defined $accountID && $args->{ID} eq $accountID);
+			my $actor = eval { Actor::get($args->{ID}) };
+			$data->{actorName} = eval { $actor->name } if $actor;
+		}
+	} elsif ($hookName eq 'quest_added' || $hookName eq 'quest_mission_updated') {
+		my $questID = $args->{questID};
+		$data->{title} = $quests_lut{$questID}{title} if defined $questID && ref $quests_lut{$questID} eq 'HASH';
+		if ($hookName eq 'quest_mission_updated' && defined $questID && ref $questList eq 'HASH') {
+			my $missions = ref $questList->{$questID} eq 'HASH' ? $questList->{$questID}{missions} : undef;
+			my $mission = ref $missions eq 'HASH' && defined $args->{mobID} ? $missions->{$args->{mobID}} : undef;
+			$data->{target} = $mission->{mob_name} if ref $mission eq 'HASH' && defined $mission->{mob_name};
+		}
+	} elsif ($hookName eq 'fail_calc_map_route') {
+		$data->{map} = $args->{map_from};
+	}
 }
 
 sub onLog {
@@ -247,7 +309,9 @@ sub handleRequest {
 		} elsif ($file eq '/command') {
 			defined $args->{cmd} && $args->{cmd} ne '' ? runCommand($args->{cmd}) : {error => 'cmd is required'};
 		} elsif ($file eq '/config') {
-			configEntry($args->{key}, $args->{value});
+			defined $args->{keys} ? configValues($args->{keys}) : configEntry($args->{key}, $args->{value});
+		} elsif ($file eq '/storage') {
+			storageList();
 		} else {
 			undef;
 		}
@@ -728,6 +792,48 @@ sub configEntry {
 		return $result;
 	}
 	return {key => $key, value => $config{$key}};
+}
+
+# Several config keys in one request: {"values": {key: value or null}}. Secret
+# keys are left out of "values" and listed under "refused".
+sub configValues {
+	my ($keys) = @_;
+	my (%values, @refused);
+	foreach my $key (split /\s*,\s*/, $keys) {
+		next if $key eq '';
+		if ($key !~ /^[\w.]+$/ || isSecretKey($key)) {
+			push @refused, $key;
+			next;
+		}
+		$values{$key} = $config{$key};
+	}
+	return {error => 'keys is required'} unless %values || @refused;
+	my %out = (values => \%values);
+	$out{refused} = \@refused if @refused;
+	return \%out;
+}
+
+# The Kafra storage while it is open; "id" is the storage index used by
+# 'storage get'.
+sub storageList {
+	return {inGame => JSON::PP::false, open => JSON::PP::false, items => []} unless inGame();
+	my $storage = eval { $char->storage };
+	my $open = $storage && eval { $storage->isReady } ? 1 : 0;
+	my @items;
+	if ($open) {
+		foreach my $item (@{$storage->getItems()}) {
+			next unless $item;
+			push @items, {
+				id         => num($item->{binID}),
+				name       => itemName($item),
+				nameID     => num($item->{nameID}),
+				amount     => num($item->{amount}),
+				type       => $itemTypes_lut{$item->{type}} || num($item->{type}),
+				identified => bool($item->{identified}),
+			};
+		}
+	}
+	return {open => bool($open), title => $storageTitle, items => \@items};
 }
 
 ##### Helpers
