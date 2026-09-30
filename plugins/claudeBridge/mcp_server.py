@@ -78,6 +78,14 @@ BLOCKED_COMMANDS = {
     "conf": "use configure",
 }
 
+# Config keys that hold credentials or connection settings; never read or written here.
+SECRET_KEY_MARKERS = ("pass", "pin", "token", "secret", "username", "master", "server", "char", "email", "alias_", "claudebridge_")
+
+
+def is_secret_key(key: str) -> bool:
+    k = key.lower()
+    return any(m in k for m in SECRET_KEY_MARKERS)
+
 # Config keys configure may change: behaviour settings, not account or connection.
 CONFIG_KEYS = {
     "attackAuto", "attackAuto_party", "attackAuto_onlyWhenSafe", "attackDistance",
@@ -133,6 +141,8 @@ async def command(cmd: str) -> dict[str, Any]:
 def compact_event(event: dict[str, Any]) -> dict[str, Any]:
     data = event.get("data")
     out: dict[str, Any] = {"seq": event["seq"], "type": event["type"]}
+    if isinstance(event.get("time"), (int, float)):
+        out["time"] = round(event["time"], 1)
     if isinstance(data, dict) and "text" in data and event["type"].startswith("log/"):
         out["domain"] = data.get("domain")
         out["text"] = data["text"][:300]
@@ -142,11 +152,21 @@ def compact_event(event: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def matches(event_type: str, wanted: list[str] | None) -> bool:
+def event_keys(event: dict[str, Any]) -> list[str]:
+    """Names an event can be matched by: its type, and for console messages also
+    log/<domain> (e.g. log/pm, log/publicchat), since the type is only log/message."""
+    keys = [event["type"]]
+    data = event.get("data")
+    if event["type"].startswith("log/") and isinstance(data, dict) and data.get("domain"):
+        keys.append(f"log/{data['domain']}")
+    return keys
+
+
+def matches(event: dict[str, Any], wanted: list[str] | None) -> bool:
     if not wanted:
         return True
-    event_type = event_type.lower()
-    return any(event_type.startswith(w.lower()) for w in wanted)
+    keys = [k.lower() for k in event_keys(event)]
+    return any(k.startswith(w.lower()) for w in wanted for k in keys)
 
 
 async def brief_status() -> dict[str, Any]:
@@ -227,12 +247,14 @@ async def get_status() -> dict[str, Any]:
 
 @game_tool(READ_ONLY)
 async def look_around(
-    kinds: list[Literal["monsters", "players", "npcs", "items", "portals"]] | None = None,
+    kinds: list[Literal["monsters", "players", "npcs", "items", "portals", "spells"]] | None = None,
     limit: int = 15,
 ) -> dict[str, Any]:
-    """Nearby monsters, players, NPCs, items on the ground and portals, nearest first.
-    Each entry has an id (use it with attack, talk_to_npc, pick_up, move_to portal),
-    name, position and distance in cells."""
+    """Nearby monsters, players, NPCs, items on the ground, portals and ground effects
+    (spells), nearest first. Each entry has an id (use it with attack, talk_to_npc,
+    pick_up, move_to portal), an oid that stays the same while the actor is around,
+    name, position and distance in cells. Monsters show attackingMe and hpPercent when
+    known; portals show destKnown."""
     return await bridge("/nearby", limit=max(1, min(limit, 50)),
                         kinds=",".join(kinds) if kinds else None)
 
@@ -245,24 +267,71 @@ async def get_inventory() -> dict[str, Any]:
 
 
 @game_tool(READ_ONLY)
-async def get_skills() -> dict[str, Any]:
-    """Learned skills with id (used by use_skill and raise_skill), level, SP cost and
-    range, plus unspent skill points."""
-    return await bridge("/skills")
+async def get_skills(include_unlearned: bool = False) -> dict[str, Any]:
+    """Skills with id (used by use_skill and raise_skill), level, SP cost, range and
+    target type, plus unspent skill points. With include_unlearned, level-0 skills the
+    character could learn (upgradable) are listed too."""
+    return await bridge("/skills", all=1 if include_unlearned else None)
+
+
+@game_tool(READ_ONLY)
+async def describe_skill(skill: str) -> dict[str, Any]:
+    """The in-game description of a skill (by id, handle such as NV_BASIC, or name),
+    as a player would read it in the skill window."""
+    return await bridge("/skill_info", skill=skill)
+
+
+@game_tool(READ_ONLY)
+async def describe_item(name_id: int) -> dict[str, Any]:
+    """The in-game description of an item type (nameID from get_inventory or
+    look_around), as a player would read it in the item window."""
+    return await bridge("/item_info", nameID=name_id)
+
+
+@game_tool(READ_ONLY)
+async def get_map_overview(cols: int = 40, rows: int = 20) -> dict[str, Any]:
+    """A coarse map of the whole current field (like the minimap): rows of characters,
+    '.' walkable, '#' blocked, '@' you, 'P' portal, 'N' npc, 'M' monster, 'p' player.
+    Each character covers scale x scale cells; the top row is the north edge."""
+    return await bridge("/map", cols=max(10, min(cols, 120)), rows=max(5, min(rows, 60)))
+
+
+@game_tool(READ_ONLY)
+async def get_npc_dialog() -> dict[str, Any]:
+    """The NPC conversation state right now: whether a dialog is open, the NPC name,
+    the accumulated text, the numbered choices, and the shop list when a shop is open."""
+    npc = await bridge("/npc")
+    talk = npc.get("talk") or {}
+    choices = talk.get("responses") or []
+    return {
+        "active": npc.get("active"),
+        "npc": talk.get("name"),
+        "text": talk.get("msg"),
+        "choices": [{"index": i, "text": c} for i, c in enumerate(choices)],
+        "store": npc.get("store") or [],
+        "store_npc": npc.get("storeNpc"),
+    }
 
 
 @game_tool(READ_ONLY)
 async def get_config(key: str) -> dict[str, Any]:
-    """Read one OpenKore config.txt setting (e.g. lockMap, attackAuto)."""
+    """Read one OpenKore config.txt behaviour setting (e.g. lockMap, attackAuto).
+    Account and connection settings are not readable."""
+    if is_secret_key(key):
+        return {"error": f"'{key}' is not readable here"}
     return await bridge("/config", key=key)
 
 
 @game_tool(READ_ONLY)
-async def recent_events(since_seq: int | None = None, limit: int = 30) -> dict[str, Any]:
-    """Game events: chat and private messages, NPC dialog, kills, deaths, level ups,
-    map changes, warnings and errors. Without since_seq, the newest events."""
+async def recent_events(since_seq: int | None = None, limit: int = 100) -> dict[str, Any]:
+    """Game events: chat and private messages, NPC dialog, kills, deaths, exp, loot,
+    level ups, map changes, warnings and errors. With since_seq, the events after that
+    sequence number (oldest first); without it, the newest events. boot_id changes when
+    the bot restarts (sequence numbers start again from 0); oldest_seq is the oldest
+    event still kept."""
     data = await bridge("/events", since=since_seq, limit=max(1, min(limit, 200)))
-    return {"latest_seq": data["latestSeq"], "events": [compact_event(e) for e in data["events"]]}
+    return {"latest_seq": data["latestSeq"], "oldest_seq": data.get("oldestSeq"),
+            "boot_id": data.get("bootId"), "events": [compact_event(e) for e in data["events"]]}
 
 
 @game_tool(READ_ONLY)
@@ -274,7 +343,9 @@ async def wait_for(
     """Wait until a game event happens, instead of polling get_status.
 
     event_types are prefixes of event types, e.g. ["target_died"], ["self_died",
-    "base_level_changed"], ["npc_talk"], ["log/pm", "packet_privMsg"], ["log/error"].
+    "base_level_changed"], ["npc_talk"], ["packet_privMsg"], ["log/error"]. Console
+    messages match both their type (log/message, log/warning, log/error) and
+    log/<domain> (log/pm, log/publicchat, log/exp, log/attacked...).
     Omit them to return on any event. Without since_seq, only events after this call
     count. Waits at most timeout_seconds (max 120) and returns the matching events,
     other recent events and a short status."""
@@ -287,11 +358,11 @@ async def wait_for(
         for event in data["events"]:
             cursor = event["seq"]
             collected.append(event)
-        matched = [e for e in collected if matches(e["type"], event_types)]
+        matched = [e for e in collected if matches(e, event_types)]
         if matched or time.monotonic() >= deadline:
             break
         await asyncio.sleep(0.5)
-    others = [e for e in collected if not matches(e["type"], event_types)]
+    others = [e for e in collected if not matches(e, event_types)]
     return {
         "timed_out": not matched,
         "matched": [compact_event(e) for e in matched[-20:]],
@@ -341,8 +412,9 @@ async def pick_up(item_id: int) -> dict[str, Any]:
 
 @game_tool(ACTION)
 async def talk_to_npc(npc_id: int) -> dict[str, Any]:
-    """Start a conversation with an NPC (id from look_around). OpenKore walks to it.
-    Returns the dialog text and the numbered choices once the NPC has answered."""
+    """Start a conversation with an NPC (id from look_around). OpenKore does not walk
+    to it: be within about 12 cells first (move_to next to it and wait until you
+    arrive). Returns the dialog text and the numbered choices once the NPC answered."""
     seq = (await bridge("/npc"))["latestSeq"]
     result = await command(f"talk {npc_id}")
     dialog = await npc_state(seq, wait_seconds=10)
@@ -389,6 +461,31 @@ async def use_item(item_id: int) -> dict[str, Any]:
 async def equip(item_id: int) -> dict[str, Any]:
     """Equip an inventory item by inventory id."""
     return await command(f"eq {item_id}")
+
+
+@game_tool(ACTION)
+async def unequip(item_id: int) -> dict[str, Any]:
+    """Take off an equipped item, by inventory id."""
+    return await command(f"uneq {item_id}")
+
+
+@game_tool(ACTION)
+async def sit() -> dict[str, Any]:
+    """Sit down (regenerates HP and SP faster; needs the Basic Skill at level 3)."""
+    return await command("sit")
+
+
+@game_tool(ACTION)
+async def stand() -> dict[str, Any]:
+    """Stand up."""
+    return await command("stand")
+
+
+@game_tool(ACTION)
+async def emote(emotion: str) -> dict[str, Any]:
+    """Show an emotion above the character (a name or number from OpenKore's emotion
+    table, e.g. "heh", "ok", "hmm", "!", "?")."""
+    return await command(f"e {emotion}")
 
 
 @game_tool(ACTION)
@@ -443,9 +540,11 @@ async def configure(key: str, value: str) -> dict[str, Any]:
     lockMap prt_fild08 (farm that map), attackAuto 2 (attack what is around),
     route_randomWalk 1, sitAuto_hp_lower 40, itemsTakeAuto 2,
     useSelf_item_0 Red Potion + useSelf_item_0_hp "< 50%". Use value "none" to clear."""
-    if key not in CONFIG_KEYS and not key.startswith(CONFIG_PREFIXES):
+    if is_secret_key(key) or (key not in CONFIG_KEYS and not key.startswith(CONFIG_PREFIXES)):
         return {"error": f"'{key}' is not an allowed behaviour setting",
                 "allowed": sorted(CONFIG_KEYS), "allowed_prefixes": list(CONFIG_PREFIXES)}
+    if "\n" in value or "\r" in value or ";;" in value:
+        return {"error": "the value must be a single line without ';;'"}
     return await bridge("/config", key=key, value=value)
 
 
@@ -465,6 +564,8 @@ async def run_command(command_line: str) -> dict[str, Any]:
     verb = command_line.strip().split(maxsplit=1)[0].lower() if command_line.strip() else ""
     if not verb:
         return {"error": "empty command"}
+    if ";;" in command_line:
+        return {"error": "one command at a time (';;' is not allowed)"}
     if verb in BLOCKED_COMMANDS:
         return {"error": f"'{verb}' is not allowed here: {BLOCKED_COMMANDS[verb]}"}
     return await command(command_line.strip())

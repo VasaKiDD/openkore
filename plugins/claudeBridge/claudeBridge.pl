@@ -28,11 +28,17 @@
 #   /state                          character status, position, AI state
 #   /nearby?limit=N&kinds=a,b       monsters, players, npcs, items, portals, nearest first
 #   /inventory                      items; "id" is the inventory index used by commands
-#   /skills                         learned skills
-#   /npc                            current NPC dialog and recent NPC messages
+#   /skills[?all=1]                 learned skills (all=1: also unlearned, level 0)
+#   /skill_info?skill=X             in-game description of a skill (id, handle or name)
+#   /item_info?nameID=N             in-game description of an item type
+#   /map?cols=40&rows=20            coarse walkability map of the current field with markers
+#   /npc                            current NPC dialog, shop list and recent NPC messages
 #   /events?since=SEQ&limit=N       game events (hooks and selected console messages)
 #   /command?cmd=TEXT               run a console command, returns its console output
 #   /config?key=K[&value=V]         read a config.txt key, or set it through 'conf'
+#
+# Every actor in /nearby carries "oid", the hex actor ID, which stays the same
+# while the actor is around; "id" is OpenKore's list index and can change.
 package claudeBridge;
 
 use strict;
@@ -59,29 +65,41 @@ use constant {
 	VERSION          => '1.0',
 	DEFAULT_PORT     => 7777,
 	DEFAULT_BIND     => '127.0.0.1',
-	MAX_EVENTS       => 500,
+	MAX_EVENTS       => 2000,
 	MAX_OUTPUT_LINES => 200,
 	DEFAULT_NEARBY   => 20,
+	MAX_DESC_CHARS   => 1500,
 };
 
 # Hooks whose arguments are recorded as events. A hook the current server
 # type never calls just never fires.
 my @EVENT_HOOKS = qw(
-	in_game disconnected self_died target_died
-	base_level_changed job_level_changed item_gathered
+	in_game disconnected self_died self_resurrected target_died monster_disappeared
+	base_level_changed job_level_changed job_changed exp_gained zeny_change
+	item_gathered item_appeared inventory_item_removed packet_useitem equipped_item unequipped_item
 	npc_talk npc_talk_responses npc_talk_done
 	packet_pubMsg packet_privMsg packet_partyMsg packet_guildMsg packet_sentPM packet_selfChat
-	packet_mapChange
+	packet_sysMsg packet_localBroadcast packet_emotion
+	packet_mapChange Network::Receive::map_changed
+	party_invite incoming_deal quest_added quest_mission_updated
+	player_spawned player_disappeared
+	route fail_calc_map_route AI_state_change changed_status
 );
 
 # Console message domains recorded as events, in addition to every warning and error.
+# (The "connection" domain is not recorded: it floods the ring and /health has the state.)
 my %EVENT_LOG_DOMAINS = map { $_ => 1 } qw(
 	npc pm pm/sent publicchat partychat guildchat schat selfchat
-	connection success teleport
+	success teleport
+	attacked attackMon attackedMiss attackMonMiss exp drop skill useItem emotion
 );
 
+# Running totals since the plugin loaded, for the agent's "internal world".
+my %counters = (kills => 0, deaths => 0, baseExp => 0, jobExp => 0, zenyGained => 0, zenySpent => 0, itemsGathered => 0);
+my $bootId = sprintf('%x-%x', int(time), $$);
+
 my %AI_MODES = (0 => 'off', 1 => 'manual', 2 => 'auto');
-my @NEARBY_KINDS = qw(monsters players npcs items portals);
+my @NEARBY_KINDS = qw(monsters players npcs items portals spells);
 
 my $json = JSON::PP->new->utf8->canonical->allow_nonref;
 my $server;
@@ -154,7 +172,29 @@ sub pushEvent {
 
 sub onEventHook {
 	my ($hookName, $args) = @_;
-	pushEvent($hookName, plain($args));
+	my $data;
+	if ($hookName eq 'exp_gained') {
+		$data = {base => num($monsterBaseExp), job => num($monsterJobExp)};
+		$counters{baseExp} += $monsterBaseExp || 0;
+		$counters{jobExp}  += $monsterJobExp  || 0;
+	} elsif ($hookName eq 'monster_disappeared') {
+		# Only deaths are interesting; walking out of view is not.
+		return unless ref $args eq 'HASH' && $args->{monster} && $args->{monster}{dead};
+		$data = plain($args);
+		$data->{dead} = JSON::PP::true;
+	} elsif ($hookName eq 'Network::Receive::map_changed') {
+		$data = plain($args);
+		$data->{map} = mapName();
+	} else {
+		$data = plain($args);
+	}
+	$counters{kills}++         if $hookName eq 'target_died';
+	$counters{deaths}++        if $hookName eq 'self_died';
+	$counters{itemsGathered}++ if $hookName eq 'item_gathered';
+	if ($hookName eq 'zeny_change' && ref $args eq 'HASH' && defined $args->{change}) {
+		$args->{change} > 0 ? ($counters{zenyGained} += $args->{change}) : ($counters{zenySpent} -= $args->{change});
+	}
+	pushEvent($hookName, $data);
 }
 
 sub onLog {
@@ -193,7 +233,13 @@ sub handleRequest {
 		} elsif ($file eq '/inventory') {
 			inventory();
 		} elsif ($file eq '/skills') {
-			skills();
+			skills($args->{all});
+		} elsif ($file eq '/skill_info') {
+			skillInfo($args->{skill});
+		} elsif ($file eq '/item_info') {
+			itemInfo($args->{nameID});
+		} elsif ($file eq '/map') {
+			mapOverview(positiveInt($args->{cols}, 40), positiveInt($args->{rows}, 20));
 		} elsif ($file eq '/npc') {
 			npcDialog();
 		} elsif ($file eq '/events') {
@@ -235,7 +281,13 @@ sub health {
 		character  => $char ? $char->{name} : undef,
 		map        => mapName(),
 		latestSeq  => $eventSeq,
+		oldestSeq  => oldestSeq(),
+		bootId     => $bootId,
 	};
+}
+
+sub oldestSeq {
+	return @events ? $events[0]{seq} : $eventSeq;
 }
 
 sub charState {
@@ -259,20 +311,120 @@ sub charState {
 		weight         => num($char->{weight}),
 		weightMax      => num($char->{weight_max}),
 		stats          => {map { $_ => num($char->{$_}) } qw(str agi vit int dex luk)},
+		statsBonus     => {map { $_ => num($char->{"${_}_bonus"}) } qw(str agi vit int dex luk)},
+		statRaiseCost  => {map { $_ => num($char->{"points_$_"}) } qw(str agi vit int dex luk)},
 		statusPoints   => num($char->{points_free}),
 		skillPoints    => num($char->{points_skill}),
+		exp            => num($char->{exp}),
+		expMax         => num($char->{exp_max}),
+		expJob         => num($char->{exp_job}),
+		expJobMax      => num($char->{exp_job_max}),
+		attack         => num($char->{attack}),
+		attackBonus    => num($char->{attack_bonus}),
+		matkMin        => num($char->{attack_magic_min}),
+		matkMax        => num($char->{attack_magic_max}),
+		def            => num($char->{def}),
+		defBonus       => num($char->{def_bonus}),
+		mdef           => num($char->{def_magic}),
+		mdefBonus      => num($char->{def_magic_bonus}),
+		hit            => num($char->{hit}),
+		flee           => num($char->{flee}),
+		fleeBonus      => num($char->{flee_bonus}),
+		critical       => num($char->{critical}),
+		attackSpeed    => num($char->{attack_speed}),
+		attackRange    => num($char->{attack_range}),
+		walkSpeed      => num($char->{walk_speed}),
+		equipment      => equipmentSummary(),
+		party          => partySummary(),
+		guild          => ref $char->{guild} eq 'HASH' ? $char->{guild}{name} : undef,
+		quests         => questsSummary(),
 		map            => mapName(),
+		mapDisplayName => scalar eval { $field ? $field->descName : undef },
+		isTown         => bool(eval { $field && $field->isCity }),
+		mapWidth       => num(eval { $field ? $field->width : undef }),
+		mapHeight      => num(eval { $field ? $field->height : undef }),
+		pvp            => num($pvp),
+		saveMap        => $config{saveMap},
 		x              => $pos->{x},
 		y              => $pos->{y},
 		sitting        => bool($char->{sitting}),
 		dead           => bool($char->{dead}),
+		casting        => bool($char->{casting}),
+		muted          => bool($char->{muted}),
+		spirits        => num($char->{spirits}),
 		statuses       => [sort map { $statusName{$_} || $_ } keys %statuses],
+		statusDetails  => [map { statusDetail($_, $statuses{$_}) } sort keys %statuses],
 		ai             => $AI_MODES{AI::state()} || AI::state(),
 		currentAction  => AI::action(),
 		actionQueue    => [@ai_seq[0 .. $last]],
 		lockMap        => $config{lockMap},
+		counters       => {map { $_ => num($counters{$_}) } keys %counters},
 		latestSeq      => $eventSeq,
+		bootId         => $bootId,
 	};
+}
+
+sub statusDetail {
+	my ($handle, $status) = @_;
+	my %out = (handle => $handle, name => $statusName{$handle} || $handle);
+	if (ref $status eq 'HASH' && $status->{tick} && $status->{time}) {
+		my $left = $status->{tick} / 1000 - (time - $status->{time});
+		$out{remainingSeconds} = int($left) if $left > 0;
+	}
+	return \%out;
+}
+
+sub equipmentSummary {
+	my %out;
+	my $equip = $char->{equipment} || {};
+	foreach my $slot (@Actor::Item::slots) {
+		my $item = $equip->{$slot};
+		$out{$slot} = $item ? itemName($item) : undef;
+	}
+	return \%out;
+}
+
+sub partySummary {
+	my $party = $char->{party};
+	return undef unless ref $party eq 'HASH' && $party->{joined};
+	my @members;
+	foreach my $id (keys %{$party->{users} || {}}) {
+		my $user = $party->{users}{$id};
+		next unless ref $user;
+		push @members, {
+			name   => $user->{name},
+			map    => $user->{map},
+			online => bool($user->{online}),
+			hp     => num($user->{hp}),
+			hpMax  => num($user->{hp_max}),
+			level  => num($user->{lv}),
+			job    => jobName($user->{jobID}),
+			admin  => bool($user->{admin}),
+		};
+	}
+	return {name => $party->{name}, members => [sort { ($a->{name} || '') cmp ($b->{name} || '') } @members]};
+}
+
+sub questsSummary {
+	return [] unless ref $questList eq 'HASH';
+	my @out;
+	foreach my $id (sort { $a <=> $b } keys %$questList) {
+		my $quest = $questList->{$id};
+		next unless ref $quest eq 'HASH';
+		my @missions;
+		foreach my $mob (values %{$quest->{missions} || {}}) {
+			next unless ref $mob eq 'HASH';
+			push @missions, {target => $mob->{mob_name}, count => num($mob->{mob_count}), goal => num($mob->{mob_goal})};
+		}
+		push @out, {
+			id       => num($id),
+			title    => ref $quests_lut{$id} eq 'HASH' ? $quests_lut{$id}{title} : undef,
+			active   => bool($quest->{active}),
+			expires  => num($quest->{time_expire}),
+			missions => \@missions,
+		};
+	}
+	return \@out;
 }
 
 sub nearby {
@@ -289,6 +441,10 @@ sub nearby {
 	my %out = (map => mapName(), x => $me->{x}, y => $me->{y});
 
 	foreach my $kind (@$kinds) {
+		if ($kind eq 'spells') {
+			$out{spells} = groundEffects($me, $limit);
+			next;
+		}
 		my $list = $lists{$kind} or next;
 		my @entries;
 		foreach my $actor (@{$list->getItems()}) {
@@ -311,13 +467,49 @@ sub addKindFields {
 	if ($kind eq 'monsters') {
 		$entry->{dmgToYou}   = num($actor->{dmgToYou})   if $actor->{dmgToYou};
 		$entry->{dmgFromYou} = num($actor->{dmgFromYou}) if $actor->{dmgFromYou};
+		$entry->{missedYou}  = num($actor->{missedYou})  if $actor->{missedYou};
+		$entry->{hpPercent}  = num($actor->{hp_percent}) if defined $actor->{hp_percent};
+		$entry->{attackingMe} = bool($actor->{dmgToYou} || $actor->{missedYou} || $actor->{castOnToYou}
+			|| (defined $actor->{target} && defined $accountID && $actor->{target} eq $accountID));
+		$entry->{casting} = JSON::PP::true if ref $actor->{casting} eq 'HASH' && %{$actor->{casting}};
+		$entry->{ignored} = JSON::PP::true if $actor->{ignore};
 	} elsif ($kind eq 'players') {
-		$entry->{job}   = jobName($actor->{jobID});
-		$entry->{level} = num($actor->{lv}) if $actor->{lv};
-		$entry->{guild} = $actor->{guild}{name} if ref $actor->{guild} eq 'HASH';
+		$entry->{job}     = jobName($actor->{jobID});
+		$entry->{level}   = num($actor->{lv}) if $actor->{lv};
+		$entry->{guild}   = $actor->{guild}{name} if ref $actor->{guild} eq 'HASH';
+		$entry->{party}   = $actor->{party}{name} if ref $actor->{party} eq 'HASH';
+		$entry->{sitting} = JSON::PP::true if $actor->{sitting};
+		$entry->{dead}    = JSON::PP::true if $actor->{dead};
 	} elsif ($kind eq 'items') {
 		$entry->{amount} = num($actor->{amount});
+	} elsif ($kind eq 'portals') {
+		# The name OpenKore gives a portal ("map -> destination") comes from its portals
+		# table. Tools may use it; an agent that explores the world drops it.
+		$entry->{destKnown} = bool(defined $entry->{name} && $entry->{name} =~ /->/);
 	}
+}
+
+# Area effects on the ground (warp portals, traps, fire walls...).
+sub groundEffects {
+	my ($me, $limit) = @_;
+	my @entries;
+	foreach my $ID (keys %spells) {
+		my $spell = $spells{$ID};
+		next unless ref $spell eq 'HASH' && ref $spell->{pos} eq 'HASH';
+		my $entry = {
+			oid    => unpack('H*', $ID),
+			id     => num($spell->{binID}),
+			name   => getSpellName($spell->{type}),
+			x      => num($spell->{pos}{x}),
+			y      => num($spell->{pos}{y}),
+			source => defined $spell->{sourceID} ? unpack('H*', $spell->{sourceID}) : undef,
+		};
+		$entry->{dist} = tileDistance($me, $entry);
+		push @entries, $entry;
+	}
+	@entries = sort { ($a->{dist} // 9999) <=> ($b->{dist} // 9999) } @entries;
+	splice(@entries, $limit) if @entries > $limit;
+	return \@entries;
 }
 
 sub inventory {
@@ -344,12 +536,14 @@ sub inventory {
 }
 
 sub skills {
+	my ($all) = @_;
 	return {inGame => JSON::PP::false} unless inGame();
 	my @out;
 	my $learned = $char->{skills} || {};
 	foreach my $handle (sort keys %$learned) {
 		my $skill = $learned->{$handle};
-		next unless ref $skill eq 'HASH' && $skill->{lv};
+		next unless ref $skill eq 'HASH';
+		next unless $skill->{lv} || $all;
 		my $name = eval { Skill->new(handle => $handle)->getName() };
 		push @out, {
 			id         => num($skill->{ID}),
@@ -358,10 +552,110 @@ sub skills {
 			level      => num($skill->{lv}),
 			sp         => num($skill->{sp}),
 			range      => num($skill->{range}),
+			targetType => num($skill->{targetType}),
 			upgradable => bool($skill->{up}),
 		};
 	}
 	return {skillPoints => num($char->{points_skill}), skills => \@out};
+}
+
+sub skillInfo {
+	my ($query) = @_;
+	return {error => 'skill is required'} unless defined $query && $query ne '';
+	my $skill = eval { Skill->new(auto => $query) };
+	my $handle = $skill ? eval { $skill->getHandle() } : undef;
+	return {error => "unknown skill '$query'"} unless $handle;
+	my $desc = $skillsDesc_lut{$handle};
+	$desc = substr($desc, 0, MAX_DESC_CHARS) . '...' if defined $desc && length $desc > MAX_DESC_CHARS;
+	my $known = $char && $char->{skills} ? $char->{skills}{$handle} : undef;
+	return {
+		id          => num(eval { $skill->getIDN() }),
+		handle      => $handle,
+		name        => eval { $skill->getName() } || $handle,
+		description => $desc,
+		targetType  => num(eval { $skill->getTargetType() }),
+		level       => $known ? num($known->{lv}) : undef,
+		sp          => $known ? num($known->{sp}) : undef,
+	};
+}
+
+sub itemInfo {
+	my ($nameID) = @_;
+	return {error => 'nameID is required'} unless defined $nameID && $nameID =~ /^\d+$/;
+	my $name = $items_lut{$nameID};
+	return {error => "unknown item id $nameID"} unless defined $name;
+	my $desc = $itemsDesc_lut{$nameID};
+	$desc = substr($desc, 0, MAX_DESC_CHARS) . '...' if defined $desc && length $desc > MAX_DESC_CHARS;
+	return {nameID => num($nameID), name => $name, description => $desc};
+}
+
+# A coarse map of the whole field: one character per block of cells, so an
+# agent can see the shape of the map and where the things it knows about are.
+# Rows go from the top (high y) to the bottom (y = 0), like the game's minimap.
+sub mapOverview {
+	my ($cols, $rows) = @_;
+	return {inGame => JSON::PP::false} unless inGame() && $field;
+	my ($width, $height) = ($field->width, $field->height);
+	return {error => 'field size unknown'} unless $width && $height;
+	my $scale = 1;
+	foreach my $s (1 .. 64) {
+		$scale = $s;
+		last if $width / $s <= $cols && $height / $s <= $rows;
+	}
+	my $gridCols = int(($width + $scale - 1) / $scale);
+	my $gridRows = int(($height + $scale - 1) / $scale);
+	my $samples = $scale > 4 ? 4 : $scale;    # sample a few cells per block
+	my @grid;
+	foreach my $row (0 .. $gridRows - 1) {
+		my $y0 = $row * $scale;
+		my $line = '';
+		foreach my $col (0 .. $gridCols - 1) {
+			my $x0 = $col * $scale;
+			my ($walkable, $total) = (0, 0);
+			foreach my $sy (0 .. $samples - 1) {
+				my $y = $y0 + int(($sy + 0.5) * $scale / $samples);
+				next if $y >= $height;
+				foreach my $sx (0 .. $samples - 1) {
+					my $x = $x0 + int(($sx + 0.5) * $scale / $samples);
+					next if $x >= $width;
+					$total++;
+					$walkable++ if $field->isWalkable($x, $y);
+				}
+			}
+			$line .= !$total ? ' ' : $walkable * 2 >= $total ? '.' : '#';
+		}
+		$grid[$row] = $line;
+	}
+	my %markers;
+	my $mark = sub {
+		my ($actor, $symbol) = @_;
+		my $pos = position($actor) or return;
+		my ($col, $row) = (int($pos->{x} / $scale), int($pos->{y} / $scale));
+		return if $col < 0 || $col >= $gridCols || $row < 0 || $row >= $gridRows;
+		$markers{"$col,$row"} = $symbol unless $markers{"$col,$row"} && $markers{"$col,$row"} eq '@';
+	};
+	$mark->($_, 'M') foreach @{$monstersList->getItems()};
+	$mark->($_, 'p') foreach @{$playersList->getItems()};
+	$mark->($_, 'N') foreach @{$npcsList->getItems()};
+	$mark->($_, 'P') foreach @{$portalsList->getItems()};
+	$mark->($char, '@');
+	foreach my $key (keys %markers) {
+		my ($col, $row) = split /,/, $key;
+		substr($grid[$row], $col, 1) = $markers{$key};
+	}
+	my $me = position($char) || {};
+	return {
+		map         => mapName(),
+		displayName => scalar eval { $field->descName },
+		isTown      => bool(eval { $field->isCity }),
+		width       => num($width),
+		height      => num($height),
+		scale       => num($scale),
+		x           => $me->{x},
+		y           => $me->{y},
+		legend      => '. walkable  # blocked  @ you  P portal  N npc  M monster  p player; each character is ' . $scale . 'x' . $scale . ' cells; the top row is the north edge (highest y), the first column is x=0',
+		rows        => [reverse @grid],
+	};
 }
 
 sub npcDialog {
@@ -370,9 +664,20 @@ sub npcDialog {
 		  || ($_->{type} eq 'log/message' && $_->{data}{domain} eq 'npc')
 	} @events;
 	splice(@recent, 0, @recent - 15) if @recent > 15;
+	my $talk = plain(\%talk);
+	$talk->{name} = getNPCName($talk{ID}) if %talk && $talk{ID};
+	my @store;
+	if ($storeList && $storeList->size) {
+		foreach my $item (@{$storeList->getItems()}) {
+			next unless $item;
+			push @store, {id => num($item->{binID}), nameID => num($item->{nameID}), name => itemName($item), price => num($item->{price})};
+		}
+	}
 	return {
 		active    => bool(%talk && $talk{ID}),
-		talk      => plain(\%talk),
+		talk      => $talk,
+		store     => \@store,
+		storeNpc  => $storeList ? $storeList->{npcName} : undef,
 		recent    => \@recent,
 		latestSeq => $eventSeq,
 	};
@@ -388,11 +693,16 @@ sub eventsSince {
 		@out = @events;
 		splice(@out, 0, @out - $limit) if @out > $limit;    # no cursor: the newest events
 	}
-	return {latestSeq => $eventSeq, events => \@out};
+	return {latestSeq => $eventSeq, oldestSeq => oldestSeq(), bootId => $bootId, events => \@out};
 }
 
 sub runCommand {
 	my ($cmd) = @_;
+	# Commands::run splits on ";;" and expands alias_* config keys before dispatch;
+	# both would let a caller smuggle a second command past a first-word check.
+	return {error => 'only one command per request (";;" is not allowed)'} if $cmd =~ /;;/;
+	my ($verb) = $cmd =~ /^\s*(\S+)/;
+	return {error => "'$verb' is an alias; run the real command"} if defined $verb && exists $config{"alias_$verb"};
 	my @lines;
 	$capture = \@lines;
 	my $ok = eval { Commands::run($cmd); 1 };
@@ -409,8 +719,10 @@ sub runCommand {
 sub configEntry {
 	my ($key, $value) = @_;
 	return {error => 'key is required'} unless defined $key && $key =~ /^[\w.]+$/;
+	return {error => "'$key' is not readable or writable through the bridge"} if isSecretKey($key);
 	if (defined $value) {
-		my $result = runCommand("conf $key $value");
+		my $force = exists $config{$key} ? '' : '-f ';
+		my $result = runCommand("conf $force$key $value");
 		$result->{key}   = $key;
 		$result->{value} = $config{$key};
 		return $result;
@@ -419,6 +731,12 @@ sub configEntry {
 }
 
 ##### Helpers
+
+# Account, login and bridge settings never leave the process.
+sub isSecretKey {
+	my ($key) = @_;
+	return $key =~ /pass|pin|token|secret|^username$|^master$|^server$|^char$|^email|^alias_|^claudeBridge_/i ? 1 : 0;
+}
 
 sub inGame {
 	return defined $conState && $conState == 5 && $char ? 1 : 0;
@@ -466,6 +784,7 @@ sub actorSummary {
 	(my $kind = ref $actor) =~ s/^Actor:://;
 	$out{kind} = $kind;
 	$out{id}     = num($actor->{binID})  if defined $actor->{binID};
+	$out{oid}    = unpack('H*', $actor->{ID}) if defined $actor->{ID} && length $actor->{ID};
 	$out{nameID} = num($actor->{nameID}) if defined $actor->{nameID};
 	my $name = eval { $actor->name };
 	$out{name} = defined $name ? $name : $actor->{name};
